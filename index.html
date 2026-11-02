@@ -1535,6 +1535,32 @@ PLANS.forEach((p, i) => {
   if (SEEN[p.id]) b.classList.add('tab-new');
   b.addEventListener('click', () => selectPlan(i)); tabs.appendChild(b);
 });
+// floor-plan PDF (A3) for the plans that have one: a plain download link on GitHub Pages or any top-level copy;
+// inside the claude.ai viewer the frame cannot download, so the file goes through the `downloads` capability,
+// and the button stays hidden there until (and unless) that capability is offered
+let dlCap = null, framed = false;
+try { framed = window.top !== window; } catch (e) { framed = true; }
+function refreshPdf() {
+  const p = PLANS[state.planIdx], a = $('t-pdf');
+  a.hidden = !(p && p.pdf) || (framed && !dlCap);
+  if (p && p.pdf) { a.href = p.pdf; a.download = p.pdfName || ''; }
+}
+if (window.claude && typeof window.claude.use === 'function') {
+  window.claude.use('downloads').then((ns) => { dlCap = ns; refreshPdf(); }, () => {});
+}
+$('t-pdf').addEventListener('click', async (ev) => {
+  if (!dlCap) return;                                   // the plain link does the download
+  ev.preventDefault();
+  const p = PLANS[state.planIdx]; if (!p || !p.pdf) return;
+  try {
+    const blob = await (await fetch(p.pdf)).blob();
+    await dlCap.save({ filename: p.pdfName || 'floor-plan.pdf', data: blob });
+  } catch (e) {
+    const code = e && e.code;
+    if (code === 'declined' || code === 'rate_limited') return;    // the viewer said no, or a prompt is already open
+    dlCap = null; refreshPdf();                                      // saves unusable in this view: hide the button
+  }
+});
 function selectPlan(i, keepPos = false) {
   state.planIdx = i; const p = PLANS[i];
   [...tabs.children].forEach((b, k) => b.setAttribute('aria-selected', k === i));
@@ -1557,8 +1583,7 @@ function selectPlan(i, keepPos = false) {
     : p.id === 'yoshida' ? 'ヨシダの図面は玄関が右側に描かれているため、他の案と同じ向き（玄関が左）になるよう180°回転して配置しています。'
     : p.id === 'kuga' ? '空画（KUGA）の図面は2025年6月の提案図面です。全長17,550で描かれていて、上階住宅の共用階段と入口の位置も他の図面と違います。'
       : 'モリタの2案は同じ日付（2026.10.15）の図面です。';
-  const pdf = $('t-pdf'); pdf.hidden = !p.pdf;            // floor-plan drawing (A3 PDF) for the plans that have one
-  if (p.pdf) { pdf.href = p.pdf; pdf.download = p.pdfName || ''; }
+  refreshPdf();
   applyToggles(); store.set('plan2', p.id);
   if (SEEN[p.id] && !store.get(SEEN[p.id], false)) { store.set(SEEN[p.id], true); setSheet(true); }
   if (i !== undefined) $('room').textContent = roomAt(state.x, state.z) || '—';
