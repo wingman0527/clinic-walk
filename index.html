@@ -79,6 +79,11 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline
 .views button[aria-pressed="true"]{background:var(--accent);color:var(--accent-ink)}
 .views button[aria-pressed="true"] kbd{color:inherit;border-color:rgba(255,255,255,.4)}
 .views button:hover:not([aria-pressed="true"]){background:var(--accent-soft)}
+.views .vsep{width:1px;align-self:stretch;margin:4px 2px;background:var(--rule)}
+.views button.real svg{width:14px;height:14px;flex:none}
+.views button.real.busy{animation:realpulse 1s ease-in-out infinite}
+@keyframes realpulse{50%{opacity:.45}}
+@media (prefers-reduced-motion:reduce){.views button.real.busy{animation:none;opacity:.6}}
 
 /* bottom row */
 .bottom-left{grid-column:1;grid-row:3;align-self:end;justify-self:start;display:flex;flex-direction:column;gap:8px;min-width:0;max-width:100%}
@@ -175,6 +180,9 @@ input[type=range]{width:100%;accent-color:var(--accent)}
       <button type="button" id="v-top" data-mode="top" aria-pressed="true">見下ろし<kbd>1</kbd></button>
       <button type="button" id="v-fp" data-mode="fp" aria-pressed="false">一人称<kbd>2</kbd></button>
       <button type="button" id="v-plan" data-mode="plan" aria-pressed="false">全体<kbd>3</kbd></button>
+      <span class="vsep" aria-hidden="true"></span>
+      <button type="button" id="v-real" class="real" aria-pressed="false" title="光・影・質感を写真に近づける（R）">
+        <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 1.2l1.5 4.3 4.3 1.5-4.3 1.5L8 12.8 6.5 8.5 2.2 7l4.3-1.5z"/><path d="M13 10.6l.6 1.6 1.6.6-1.6.6-.6 1.6-.6-1.6-1.6-.6 1.6-.6z" opacity=".7"/></svg>リアル<kbd>R</kbd></button>
     </div>
     <div class="bottom-left">
       <div class="measure-read panel" id="mread" hidden></div>
@@ -223,6 +231,7 @@ input[type=range]{width:100%;accent-color:var(--accent)}
       <label class="switch" for="opt-grid">床の1mグリッド <input type="checkbox" id="opt-grid" checked></label>
       <label class="switch" for="opt-labels">部屋名 <input type="checkbox" id="opt-labels" checked></label>
       <label class="switch" for="opt-ceil">一人称で天井を表示 <input type="checkbox" id="opt-ceil" checked></label>
+      <label class="switch" for="opt-real">リアル表示（光・影・質感） <input type="checkbox" id="opt-real"></label>
     </section>
     <section>
       <h3>操作</h3>
@@ -248,6 +257,7 @@ input[type=range]{width:100%;accent-color:var(--accent)}
     }
   }, 15000);
 </script>
+<script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"}}</script>
 <script type="module">
 import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js';
 
@@ -289,7 +299,8 @@ const scene = new THREE.Scene();
 const persp = new THREE.PerspectiveCamera(50, 1, 0.05, 400);
 const ortho = new THREE.OrthographicCamera(-10, 10, 10, -10, 0.1, 200);
 const hemi = new THREE.HemisphereLight(0xfbfdff, 0xd9d2c6, 1.75);
-scene.add(hemi, new THREE.AmbientLight(0xffffff, 0.55));
+const amb = new THREE.AmbientLight(0xffffff, 0.55);
+scene.add(hemi, amb);
 const sun = new THREE.DirectionalLight(0xfff6ea, 1.55);
 sun.castShadow = true;
 sun.shadow.mapSize.set(TOUCH ? 1024 : 2048, TOUCH ? 1024 : 2048);
@@ -482,6 +493,76 @@ const M = {
   lineInk: new THREE.MeshBasicMaterial({ color: 0x7d878c }),
 };
 const ARCH = [M.wall, M.glass, M.frosted, M.alu, M.door, M.doorFrame, M.handle, M.partWhite, M.oak];
+
+/* ============================================================ realistic mode (リアル表示) */
+// Closer to a photo: light and reflections from a room environment (image-based lighting), a light under each
+// ceiling panel, a low sun that comes in through the windows (the ceiling casts its shadow in first person), and
+// ambient occlusion (soft shading in corners and under furniture) in first person. The add-ons load from the CDN
+// the first time it is switched on; the normal look is restored exactly when it is switched off.
+const REAL_LIGHT = 1;                      // ceiling lights are scaled by TUNE.light
+const TUNE = { env: 0.3, exp: 0.75, light: 3, sun: 2.0, hemi: 0.2, ao: 0.85, marble: 0.2 };   // realistic-mode balance
+const REAL = { on: false, ready: false, loading: null, env: null, composer: null, gtao: null };
+const REAL_BASE = { hemi: hemi.intensity, amb: amb.intensity, sun: sun.intensity, fill: fill.intensity,
+  marbleR: M.floorMarble.roughness, glassO: M.glass.opacity, panel: M.lightPanel.color.clone(), exp: renderer.toneMappingExposure };
+const STD_MATS = Object.values(M).filter((m) => m.isMeshStandardMaterial);
+const realRatio = () => Math.min(renderer.getPixelRatio(), TOUCH ? 1 : 1.5);   // the ambient-occlusion passes are costly on dense screens
+function placeSun() {
+  if (!world.center) return; const [cx, cz] = world.center;
+  if (REAL.on && REAL.ready) sun.position.set(cx - 5, 8.5, cz + 11);   // about 35 degrees, through the windows
+  else sun.position.set(cx - 2.5, 16, cz + 3.5);
+  sun.target.position.set(cx, 0, cz); sun.target.updateMatrixWorld();
+}
+async function loadReal() {
+  if (REAL.ready) return true;
+  if (!REAL.loading) REAL.loading = (async () => {
+    const [{ RoomEnvironment }, { EffectComposer }, { RenderPass }, { GTAOPass }, { OutputPass }] = await Promise.all([
+      import('three/addons/environments/RoomEnvironment.js'), import('three/addons/postprocessing/EffectComposer.js'),
+      import('three/addons/postprocessing/RenderPass.js'), import('three/addons/postprocessing/GTAOPass.js'),
+      import('three/addons/postprocessing/OutputPass.js')]);
+    const pm = new THREE.PMREMGenerator(renderer);
+    REAL.env = pm.fromScene(new RoomEnvironment(renderer), 0.04).texture; pm.dispose();
+    const w = canvas.clientWidth || 1, h = canvas.clientHeight || 1;
+    const comp = new EffectComposer(renderer, new THREE.WebGLRenderTarget(w, h, { type: THREE.HalfFloatType, samples: TOUCH ? 0 : 4 }));
+    comp.addPass(new RenderPass(scene, persp));
+    const gtao = new GTAOPass(scene, persp, w, h);
+    gtao.updateGtaoMaterial({ radius: 0.5, distanceExponent: 1.5, thickness: 1.2, scale: 1.15, samples: TOUCH ? 8 : 16 });
+    gtao.updatePdMaterial({ lumaPhi: 10, depthPhi: 2, normalPhi: 3, radius: 6, samples: TOUCH ? 8 : 16 });
+    gtao.blendIntensity = 0.85;
+    const keep = gtao.overrideVisibility.bind(gtao);   // glass and labels must not cast ambient occlusion
+    gtao.overrideVisibility = () => { keep(); scene.traverse((o) => { if ((o.isMesh && o.material && o.material.transparent) || o.isSprite) o.visible = false; }); };
+    comp.addPass(gtao); comp.addPass(new OutputPass());
+    comp.setPixelRatio(realRatio()); comp.setSize(w, h);
+    REAL.composer = comp; REAL.gtao = gtao; REAL.ready = true;
+  })();
+  try { await REAL.loading; return true; } catch (e) { console.warn('realistic mode', e); REAL.loading = null; return false; }
+}
+function applyReal() {
+  const on = REAL.on && REAL.ready, B = REAL_BASE;
+  scene.environment = on ? REAL.env : null;
+  for (const m of STD_MATS) m.envMapIntensity = on ? TUNE.env : 1;
+  renderer.toneMappingExposure = on ? TUNE.exp : B.exp;
+  hemi.intensity = on ? TUNE.hemi : B.hemi; amb.intensity = on ? 0 : B.amb; fill.intensity = on ? 0 : B.fill;
+  sun.intensity = on ? TUNE.sun : B.sun;
+  if (world.realLights) for (const L of world.realLights.children) L.intensity = TUNE.light * (L.userData.k || 1);
+  if (REAL.gtao) REAL.gtao.blendIntensity = TUNE.ao;
+  M.floorMarble.roughness = on ? TUNE.marble : B.marbleR;          // polished marble picks up reflections
+  M.glass.opacity = on ? 0.18 : B.glassO;
+  M.lightPanel.color.copy(B.panel); if (on) M.lightPanel.color.multiplyScalar(2.4);   // panels read as lit
+  if (world.realLights) world.realLights.visible = on;
+  if (world.ceiling) world.ceiling.traverse((o) => { if (o.isMesh && o.material === M.ceiling) o.castShadow = on && state.mode === 'fp'; });
+  placeSun();
+  const b = document.getElementById('v-real'); if (b) b.setAttribute('aria-pressed', REAL.on);
+  const c = document.getElementById('opt-real'); if (c) c.checked = REAL.on;
+}
+async function setReal(on) {
+  REAL.on = on; store.set('real', on); applyReal();
+  if (on && !REAL.ready) {
+    const b = document.getElementById('v-real'); b && b.classList.add('busy');
+    const ok = await loadReal(); b && b.classList.remove('busy');
+    if (!ok) { REAL.on = false; store.set('real', false); if (typeof flash === 'function') flash('リアル表示を読み込めませんでした'); }
+    applyReal();
+  }
+}
 const cutPlane = new THREE.Plane(new THREE.Vector3(0, -1, 0), CUT);
 function setCut(on) {
   for (const m of ARCH) { m.clippingPlanes = on ? [cutPlane] : null; m.clipShadows = on; m.needsUpdate = true; }
@@ -1131,11 +1212,15 @@ function buildPlan(plan) {
   const ceil = new THREE.Group();
   const cg = new THREE.PlaneGeometry(bx2 - bx1, bz2 - bz1); cg.rotateX(Math.PI / 2);
   const cm = mesh(cg, M.ceiling, (bx1 + bx2) / 2, H, (bz1 + bz2) / 2); ceil.add(cm);
-  const LB = new Batcher();
+  const LB = new Batcher(); const spots = [];
   for (let x = bx1 + 1.2; x < bx2 - 0.6; x += 2.4) for (let z = bz1 + 1.0; z < bz2 - 0.5; z += 1.8) {
     if (plan.zones.some((zr) => inRect(x, z, normRect(zr))) || hitsWall(x, z)) continue;
-    LB.bake(boxM(0.6, 0.02, 0.6, M.lightPanel, x, H - 0.012, z));
+    LB.bake(boxM(0.6, 0.02, 0.6, M.lightPanel, x, H - 0.012, z)); spots.push([x, z]);
   }
+  // realistic mode: one light under each ceiling panel (every other one when there are many), no shadows
+  const RL = new THREE.Group(); RL.visible = false; const every = spots.length > 18 ? 2 : 1;
+  spots.forEach(([x, z], i) => { if (i % every) return; const L = new THREE.PointLight(0xfff3e4, REAL_LIGHT * every, 8, 2); L.userData.k = every; L.position.set(x, H - 0.15, z); RL.add(L); });
+  root.add(RL); world.realLights = RL;
   LB.build(ceil, { noShadow: true });
   ceil.traverse((o) => { o.castShadow = false; o.receiveShadow = false; });
   root.add(ceil); world.ceiling = ceil;
@@ -1165,7 +1250,7 @@ function buildPlan(plan) {
 
   // sun covers the building
   const cx = (bx1 + bx2) / 2, cz = (bz1 + bz2) / 2;
-  sun.position.set(cx - 2.5, 16, cz + 3.5); sun.target.position.set(cx, 0, cz); sun.shadow.camera.updateProjectionMatrix();
+  world.center = [cx, cz]; placeSun(); sun.shadow.camera.updateProjectionMatrix();
   fill.position.set(cx + 6, 8, cz - 8); fill.target.position.set(cx, 0, cz);
 
   scene.add(root); labelMode = '';
@@ -1593,10 +1678,10 @@ function setMode(m) {
   if (m === 'fp') { state.yaw = state.facing; state.fpPitch = -0.05; }
   if (state.mode === 'fp' && m === 'top') state.facing = state.yaw;
   state.mode = m; store.set('mode', m);
-  for (const b of document.querySelectorAll('.views button')) b.setAttribute('aria-pressed', b.dataset.mode === m);
+  for (const b of document.querySelectorAll('.views button[data-mode]')) b.setAttribute('aria-pressed', b.dataset.mode === m);
   applyToggles(); resize();
 }
-document.querySelectorAll('.views button').forEach((b) => b.addEventListener('click', () => setMode(b.dataset.mode)));
+document.querySelectorAll('.views button[data-mode]').forEach((b) => b.addEventListener('click', () => setMode(b.dataset.mode)));
 function applyToggles() {
   const fp = state.mode === 'fp';
   setCut(!fp);
@@ -1608,11 +1693,14 @@ function applyToggles() {
   $('keyplan').hidden = state.mode === 'plan';
   $('t-grid').setAttribute('aria-pressed', state.grid);
   $('opt-grid').checked = state.grid; $('opt-labels').checked = state.labels; $('opt-ceil').checked = state.ceil;
+  applyReal();
 }
 $('t-grid').addEventListener('click', () => { state.grid = !state.grid; store.set('grid', state.grid); applyToggles(); });
 $('opt-grid').addEventListener('change', (e) => { state.grid = e.target.checked; store.set('grid', state.grid); applyToggles(); });
 $('opt-labels').addEventListener('change', (e) => { state.labels = e.target.checked; applyToggles(); });
 $('opt-ceil').addEventListener('change', (e) => { state.ceil = e.target.checked; applyToggles(); });
+$('opt-real').addEventListener('change', (e) => setReal(e.target.checked));
+$('v-real').addEventListener('click', () => setReal(!REAL.on));
 $('t-measure').addEventListener('click', () => setMeasure(!state.measure));
 function setKeyplanOpen(open) { $('keyplan').classList.toggle('collapsed', !open); $('kp-toggle').setAttribute('aria-expanded', open); store.set('kpOpen', open); if (open) drawKeyplanBase(); }
 $('kp-toggle').addEventListener('click', () => setKeyplanOpen($('keyplan').classList.contains('collapsed')));
@@ -1643,6 +1731,7 @@ addEventListener('keydown', (e) => {
   else if (k === 'm') setMeasure(!state.measure);
   else if (k === 'g') { state.grid = !state.grid; applyToggles(); }
   else if (k === 'i') setSheet(sheet.hidden);
+  else if (k === 'r') setReal(!REAL.on);
   else if (k === 'escape') { setSheet(false); setMeasure(false); }
   keys.add(k);
   if (['arrowup', 'arrowdown', 'arrowleft', 'arrowright', ' '].includes(k)) e.preventDefault();
@@ -1733,6 +1822,7 @@ function updatePlanCam() {
 }
 function resize() {
   const w = canvas.clientWidth, h = canvas.clientHeight; renderer.setSize(w, h, false);
+  if (REAL.composer) { REAL.composer.setPixelRatio(realRatio()); REAL.composer.setSize(w, h); }
   persp.aspect = w / h;
   if (state.mode === 'fp') { const hf = 84 * Math.PI / 180; persp.fov = clamp(2 * Math.atan(Math.tan(hf / 2) / persp.aspect) * 180 / Math.PI, 55, 92); }
   else persp.fov = w < 760 ? 58 : 48;
@@ -1828,7 +1918,9 @@ function scaleLabels() {
 let last = performance.now();
 function frame(now) {
   const dt = Math.min(0.05, (now - last) / 1000); last = now;
-  tick(dt); renderer.render(scene, activeCam());
+  tick(dt);
+  if (REAL.on && REAL.ready && state.mode === 'fp') REAL.composer.render(dt);   // ambient occlusion in first person
+  else renderer.render(scene, activeCam());
   requestAnimationFrame(frame);
 }
 
@@ -1843,11 +1935,13 @@ function start(saved = {}) {
   setMode(saved.mode || store.get('mode', 'top'));
   applyToggles(); resize();
   $('loading').classList.add('done');
+  if (store.get('real', false)) setReal(true);
   requestAnimationFrame((t) => { last = t; frame(t); });
 }
 window.claude?.hot?.snapshot?.(() => ({ plan: PLANS[state.planIdx].id, mode: state.mode, x: state.x, z: state.z, yaw: state.yaw, facing: state.facing, height: Math.round(state.height * 100) }));
 const boot = () => (window.claude?.hot?.ready ? window.claude.hot.ready(start) : start(window.claude?.hot?.data ?? {}));
 (document.fonts && document.fonts.ready ? Promise.race([document.fonts.ready, new Promise((r) => setTimeout(r, 1500))]) : Promise.resolve()).then(boot);
-window.__clinic = { renderer, state, world, setMode, selectPlan, walkTo, measureTap, setMeasure, findPath, roomAt, nearestFree, cellIndex, sim: (sec) => { for (let t = 0; t < sec; t += 1 / 60) tick(1 / 60); return [state.x, state.z]; }, keys };
+const renderNow = () => { if (REAL.on && REAL.ready && state.mode === 'fp') REAL.composer.render(0); else renderer.render(scene, activeCam()); };
+window.__clinic = { renderer, state, world, setMode, setReal, REAL, renderNow, TUNE, applyReal, selectPlan, walkTo, measureTap, setMeasure, findPath, roomAt, nearestFree, cellIndex, sim: (sec) => { for (let t = 0; t < sec; t += 1 / 60) tick(1 / 60); return [state.x, state.z]; }, keys };
 
 </script>
